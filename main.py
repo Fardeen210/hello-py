@@ -3,7 +3,8 @@ import json
 from contextlib import redirect_stdout
 from io import StringIO
 from typing import Any, Callable, TypedDict
-
+import csv
+from unittest import result
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 
@@ -70,6 +71,7 @@ async def run_agent_loop(
     for step in range(max_steps):
         if verbose:
             print(f"\n=== Step {step + 1}/{max_steps} ===")
+            
 
         response = await client.messages.create(
             model=model, max_tokens=1000, tools=tools, messages=messages
@@ -90,18 +92,26 @@ async def run_agent_loop(
                 tool_name = content.name
 
                 if tool_name in tool_handlers:
+                    print(f"Using tool: {tool_name}")
+                    print(f"Tool input: {content.input}")
+                    print(f"Verbose mode: {verbose}")
                     if verbose:
                         print(f"Using tool: {tool_name}")
+                        print(f"\nReached maximum steps ({max_steps}) without submitting answer.")
+
 
                     # Extract arguments based on tool
                     handler = tool_handlers[tool_name]
                     tool_input = content.input
+
+                    print(f"Tool input: {tool_input}")
 
                     # Call the appropriate tool handler
                     if tool_name == "python_expression":
                         assert (
                             isinstance(tool_input, dict) and "expression" in tool_input
                         )
+
                         if verbose:
                             print("\nInput:")
                             print("```")
@@ -114,6 +124,7 @@ async def run_agent_loop(
                             print("```")
                             print(result)
                             print("```")
+
                     elif tool_name == "submit_answer":
                         assert isinstance(tool_input, dict) and "answer" in tool_input
                         result = handler(tool_input["answer"])
@@ -155,6 +166,16 @@ async def run_agent_loop(
         print(f"\nReached maximum steps ({max_steps}) without submitting answer.")
     return None
 
+def expected_answer(result: Any):
+    """Checks if R² improvement passes 0.05 threshold."""
+    try:
+        r2 = float(result.get("r2_score", 0))
+        baseline = float(result.get("baseline_r2", 0))
+        print(f"Evaluating expected_answer: {r2} - {baseline}")
+        return r2 - baseline >= 0.05
+    
+    except Exception:
+        return False
 
 async def run_single_test(
     run_id: int,
@@ -163,7 +184,7 @@ async def run_single_test(
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
     expected_answer: Any,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> tuple[int, bool, Any]:
     if verbose:
         print(f"\n\n{'=' * 20} RUN {run_id}/{num_runs} {'=' * 20}")
@@ -175,9 +196,23 @@ async def run_single_test(
         max_steps=5,
         verbose=verbose,
     )
+    success = False  # default in case of exception
 
-    success = result == expected_answer
+    print(f"Run {run_id} result: {result}")
 
+    try:
+        if callable(expected_answer):
+            # expected_answer is a grading function -> returns True/False
+            success = expected_answer(result)
+            if success:
+                print(f"✓ Run {run_id}: SUCCESS - Got {result} - {success}")
+        else:
+            # fallback: direct comparison
+            success = result == expected_answer
+
+    except Exception as e:
+        print(f"Error while evaluating expected_answer: {e}")
+    
     if success:
         print(f"✓ Run {run_id}: SUCCESS - Got {result}")
     else:
@@ -185,12 +220,11 @@ async def run_single_test(
 
     return run_id, success, result
 
-
 async def main(concurrent: bool = True):
     tools: list[ToolUnionParam] = [
         {
             "name": "python_expression",
-            "description": "Evaluates a Python expression",
+            "description": "Evaluates a Python expression using data sci",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -206,9 +240,11 @@ async def main(concurrent: bool = True):
             "name": "submit_answer",
             "description": "Submit the final answer",
             "input_schema": {
-                "type": "object",
-                "properties": {"answer": {"description": "The final answer to submit"}},
-                "required": ["answer"],
+                "answer": {
+                    "r2_score": float,
+                    "baseline_r2": float,
+                    "features_used": ["YEAR_numeric", "VOTES_numeric", "GENRE_count"]
+                }
             },
         },
     ]
@@ -218,11 +254,13 @@ async def main(concurrent: bool = True):
         "submit_answer": submit_answer_tool,
     }
 
-    # Run the test 10 times and track success rate
-    num_runs = 10
-    expected_answer = 8769
-    prompt = "Calculate (2^10 + 3^5) * 7 - 100. Use the python_expression tool and then submit the answer."
+    # Run the test 3 times and track success rate
+    num_runs = 1
+    def load_markdown(path: str) -> str:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
 
+    prompt = load_markdown("task/prompt.md")
     execution_mode = "concurrently" if concurrent else "sequentially"
     print(f"Running {num_runs} test iterations {execution_mode}...")
     print("=" * 60)
@@ -267,7 +305,13 @@ async def main(concurrent: bool = True):
     print(f"  Pass Rate: {pass_rate:.1f}%")
     print(f"{'=' * 60}")
 
+    with open("run_details.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if f.tell() == 0:
+            writer.writerow(["run_id", "success", "result"])
+        for run_id, success, result in results:
+            writer.writerow([run_id, success, result])
 
 if __name__ == "__main__":
     # Set to True for concurrent execution, False for sequential execution
-    asyncio.run(main(concurrent=True))
+    asyncio.run(main(concurrent=False))
